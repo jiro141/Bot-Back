@@ -1,0 +1,178 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base
+from datetime import datetime
+import os
+from dotenv import load_dotenv
+import openai
+import shutil
+from pydantic import BaseModel
+
+# === Configuración inicial ===
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Directorios de archivos
+AUDIO_DIR = "audios"
+RESPONSE_DIR = "responses"
+os.makedirs(AUDIO_DIR, exist_ok=True)
+os.makedirs(RESPONSE_DIR, exist_ok=True)
+
+# === Base de datos ===
+DATABASE_URL = "sqlite:///./interactions.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+class Interaction(Base):
+    __tablename__ = "interactions"
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    audio_filename = Column(String)
+    transcription = Column(String)
+    ia_response = Column(String)
+    tts_audio_filename = Column(String)
+
+class StaticResponse(Base):
+    __tablename__ = "static_responses"
+    id = Column(Integer, primary_key=True, index=True)
+    keyword = Column(String, unique=True, index=True)
+    answer = Column(String)
+
+Base.metadata.create_all(bind=engine)
+
+# === FastAPI App ===
+app = FastAPI(
+    title="Asistente de Voz IA",
+    description="Un solo endpoint: recibe audio, responde con audio IA usando Whisper+GPT4o+TTS.",
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Puedes restringir a ["http://localhost:5173"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Servir archivos .mp3 públicamente
+app.mount("/responses", StaticFiles(directory=RESPONSE_DIR), name="responses")
+
+@app.post("/ask", summary="Envía un audio, recibe respuesta en audio (mp3)")
+async def ask_ai(file: UploadFile = File(...)):
+    # 1. Guardar archivo recibido
+    try:
+        input_ext = file.filename.split('.')[-1]
+        input_filename = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{input_ext}"
+        input_path = os.path.join(AUDIO_DIR, input_filename)
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error guardando audio: {str(e)}")
+
+    # 2. Transcripción con Whisper
+    try:
+        with open(input_path, "rb") as audio_file:
+            transcript = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text"
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error transcribiendo: {str(e)}")
+
+    texto_transcrito = transcript.strip()
+
+    # 3. Buscar respuesta estática
+    db = SessionLocal()
+    try:
+        static_responses = db.query(StaticResponse).all()
+        ia_response = None
+        for sr in static_responses:
+            if sr.keyword.lower() in texto_transcrito.lower():
+                ia_response = sr.answer
+                break
+    finally:
+        db.close()
+
+    # 4. Si no hay respuesta estática, usar GPT
+    if ia_response is None:
+        try:
+            response = openai.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": texto_transcrito}]
+            )
+            ia_response = response.choices[0].message.content.strip()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error con GPT-4o: {str(e)}")
+
+    # 5. Convertir texto a voz
+    try:
+        tts_audio_filename = f"response_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.mp3"
+        tts_audio_path = os.path.join(RESPONSE_DIR, tts_audio_filename)
+        tts_response = openai.audio.speech.create(
+            model="tts-1",
+            voice="alloy",
+            input=ia_response
+        )
+        with open(tts_audio_path, "wb") as f:
+            f.write(tts_response.content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando audio TTS: {str(e)}")
+
+    # 6. Guardar interacción
+    db = SessionLocal()
+    try:
+        inter = Interaction(
+            audio_filename=input_filename,
+            transcription=texto_transcrito,
+            ia_response=ia_response,
+            tts_audio_filename=tts_audio_filename,
+        )
+        db.add(inter)
+        db.commit()
+    finally:
+        db.close()
+
+    # 7. Devolver audio como respuesta directa
+    return FileResponse(
+        tts_audio_path,
+        media_type="audio/mpeg",
+        filename=tts_audio_filename,
+    )
+
+# === Modelo y endpoint para respuestas estáticas ===
+class StaticResponseCreate(BaseModel):
+    keyword: str
+    answer: str
+
+@app.post("/static-response/")
+def create_static_response(data: StaticResponseCreate):
+    db = SessionLocal()
+    exists = db.query(StaticResponse).filter(StaticResponse.keyword == data.keyword).first()
+    if exists:
+        db.close()
+        raise HTTPException(status_code=400, detail="Keyword ya existe.")
+    sr = StaticResponse(keyword=data.keyword, answer=data.answer)
+    db.add(sr)
+    db.commit()
+    db.close()
+    return {"ok": True, "keyword": data.keyword, "answer": data.answer}
+
+# === Endpoint que devuelve la ruta del último .mp3 generado ===
+@app.get("/last-audio-file-path", summary="Devuelve la ruta del último audio generado (uso en frontend)")
+def get_last_audio_path():
+    db = SessionLocal()
+    try:
+        last_interaction = db.query(Interaction).order_by(Interaction.timestamp.desc()).first()
+        if not last_interaction:
+            raise HTTPException(status_code=404, detail="No hay interacciones registradas.")
+        
+        audio_url_path = f"/responses/{last_interaction.tts_audio_filename}"
+        return JSONResponse(content={"audio_path": audio_url_path})
+    finally:
+        db.close()
