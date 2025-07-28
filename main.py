@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -10,6 +10,8 @@ from pydantic import BaseModel
 import shutil
 import openai
 import os
+import re
+import unicodedata
 
 # === Cargar variables de entorno ===
 load_dotenv()
@@ -45,6 +47,14 @@ class StaticResponse(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# === Modelos Pydantic ===
+class TextToSpeechInput(BaseModel):
+    text: str
+
+class StaticResponseCreate(BaseModel):
+    keyword: str
+    answer: str
+
 # === Instancia de la aplicación FastAPI ===
 app = FastAPI(
     title="Asistente de Voz IA",
@@ -60,17 +70,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# === Montar carpeta de audios generados ===
+# === Montar carpeta de respuestas en /responses ===
 app.mount("/responses", StaticFiles(directory=RESPONSE_DIR), name="responses")
 
-# === Endpoint principal: procesamiento de audio ===
+# === Función para convertir texto a slug ===
+def slugify(text: str) -> str:
+    text = unicodedata.normalize('NFKD', text)
+    text = text.encode('ascii', 'ignore').decode('utf-8')
+    text = re.sub(r'[^\w\s-]', '', text).strip().lower()
+    return re.sub(r'[-\s]+', '-', text)
+
+# === Endpoint: audio -> texto -> respuesta IA -> audio ===
 @app.post("/ask", summary="Envía un audio, recibe respuesta en audio (mp3)")
 async def ask_ai(file: UploadFile = File(...)):
     try:
         ext = file.filename.split('.')[-1]
         input_filename = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
         input_path = os.path.join(AUDIO_DIR, input_filename)
-
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
@@ -114,13 +130,11 @@ async def ask_ai(file: UploadFile = File(...)):
     try:
         tts_audio_filename = f"response_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.mp3"
         tts_audio_path = os.path.join(RESPONSE_DIR, tts_audio_filename)
-
         tts_response = openai.audio.speech.create(
             model="tts-1",
             voice="alloy",
             input=ia_response
         )
-
         with open(tts_audio_path, "wb") as f:
             f.write(tts_response.content)
     except Exception as e:
@@ -140,17 +154,55 @@ async def ask_ai(file: UploadFile = File(...)):
     finally:
         db.close()
 
-    return FileResponse(
-        tts_audio_path,
-        media_type="audio/mpeg",
-        filename=tts_audio_filename,
-    )
+    return FileResponse(tts_audio_path, media_type="audio/mpeg", filename=tts_audio_filename)
 
-# === Modelo y endpoint para respuestas estáticas ===
-class StaticResponseCreate(BaseModel):
-    keyword: str
-    answer: str
+# === Endpoint: convierte texto a voz directamente ===
+@app.post("/text-to-speech", summary="Convierte texto a voz (audio mp3)")
+def text_to_speech(payload: TextToSpeechInput):
+    if not payload.text.strip():
+        raise HTTPException(status_code=400, detail="El texto no puede estar vacío.")
 
+    try:
+        tts_audio_filename = f"tts_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.mp3"
+        tts_audio_path = os.path.join(RESPONSE_DIR, tts_audio_filename)
+        tts_response = openai.audio.speech.create(
+            model="tts-1",
+            voice="alloy",
+            input=payload.text
+        )
+        with open(tts_audio_path, "wb") as f:
+            f.write(tts_response.content)
+
+        db = SessionLocal()
+        try:
+            interaction = Interaction(
+                audio_filename=None,
+                transcription=payload.text,
+                ia_response=payload.text,
+                tts_audio_filename=tts_audio_filename
+            )
+            db.add(interaction)
+            db.commit()
+        finally:
+            db.close()
+
+        return FileResponse(tts_audio_path, media_type="audio/mpeg", filename=tts_audio_filename)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando audio desde texto: {str(e)}")
+
+# === Endpoint: retorna audio pregrabado según pregunta ===
+@app.get("/audio-from-question", summary="Devuelve audio pregrabado para una pregunta")
+def get_audio_from_question(question: str = Query(..., description="Texto exacto de la pregunta")):
+    slug = slugify(question)
+    filename = f"{slug}.mp3"
+    filepath = os.path.join(RESPONSE_DIR, filename)
+
+    if not os.path.isfile(filepath):
+        raise HTTPException(status_code=404, detail="No se encontró audio para esta pregunta.")
+
+    return FileResponse(filepath, media_type="audio/mpeg", filename=filename)
+
+# === Endpoint: crear respuesta estática ===
 @app.post("/static-response/", summary="Agrega una respuesta estática asociada a una palabra clave")
 def create_static_response(data: StaticResponseCreate):
     db = SessionLocal()
@@ -164,7 +216,7 @@ def create_static_response(data: StaticResponseCreate):
     db.close()
     return {"ok": True, "keyword": data.keyword, "answer": data.answer}
 
-# === Devuelve la ruta del último audio generado (para frontend) ===
+# === Endpoint: devuelve el path del último audio generado ===
 @app.get("/last-audio-file-path", summary="Devuelve el path del último audio generado")
 def get_last_audio_path():
     db = SessionLocal()
